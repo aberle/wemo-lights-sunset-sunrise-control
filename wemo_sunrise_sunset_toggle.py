@@ -6,9 +6,10 @@ import logging
 import json
 import requests
 import datetime
+import traceback
 from enum import Enum
 from dateutil import tz
-from time import mktime, sleep
+from time import mktime, sleep, strftime, gmtime
 from argparse import ArgumentParser
 
 
@@ -23,32 +24,58 @@ class LightController(object):
     DATE_FMT_STRING = '%Y-%m-%dT%H:%M:%S+00:00'
     POST_MIDNIGHT_BUFFER_SEC = 10
     PRE_SUNSET_BUFFER_SECONDS = 30 * 60  # Turn the lights on this many seconds before actual sunset time
-
-    def convert_utc_string_to_local_datetime_obj(self, utc_str):
-        time_obj = time.strptime(utc_str, self.DATE_FMT_STRING)
-        time_obj = datetime.datetime.fromtimestamp(mktime(time_obj))
-        utc = time_obj.replace(tzinfo=self.UTC_ZONE)
-        return utc.astimezone(self.LOCAL_ZONE)
-
-    def discover_devices(self):
-        # TODO: This finds all WeMo devices, it doesn't filter by which devices are lights or not (maybe I don't care, I only have lights)
-        logging.info("Discovering WeMo devices on the local network...")
-        t0 = time.time()
-        self.devices = pywemo.discover_devices()
-        logging.info(f"Found {len(self.devices)} WeMo devices in {time.time() - t0:.2f} seconds.")
+    LIGHT_DEVICE_TYPES = ['LightSwitch', 'Switch', 'Dimmer']
+    LIGHT_RESPONSE_TIMEOUT_SEC = 10
+    LIGHT_RESPONSE_BACKOFF_SEC = 0.25
+    HTTP_REQUEST_TIMEOUT_SEC = 10
+    RELAUNCH_SLEEP_SEC = 10
 
     def __init__(self, lat, lng):
         super(LightController, self).__init__()
         self.sunrise_sunset_api_url_base = f'https://api.sunrise-sunset.org/json?lat={lat}&lng={lng}&formatted=0'
         self.set_schedule()
 
+        # Make sure that if we crashed while trying to turn on/off lights we don't come back in a bad state
+        now = self.now()
+        if now > self.sunset_time:
+            self.turn_on_lights()
+        elif now > self.sunrise_time:
+            self.turn_off_lights()
+
+    def convert_utc_string_to_local_datetime_obj(self, utc_str):
+        """
+        Converts the API result UTC strings to a local datetime.datetime
+        """
+        time_obj = time.strptime(utc_str, self.DATE_FMT_STRING)
+        time_obj = datetime.datetime.fromtimestamp(mktime(time_obj))
+        utc = time_obj.replace(tzinfo=self.UTC_ZONE)
+        return utc.astimezone(self.LOCAL_ZONE)
+
+    def discover_devices(self):
+        """
+        This finds all WeMo devices that are in the self.LIGHT_DEVICE_TYPES list
+        """
+        logging.info("Discovering WeMo devices on the local network...")
+        t0 = time.time()
+        self.devices = [d for d in pywemo.discover_devices() if d.device_type in self.LIGHT_DEVICE_TYPES]
+        logging.info(f"Found {len(self.devices)} WeMo devices in {time.time() - t0:.2f} seconds.")
+
+    def now(self):
+        """
+        Returns a datetime.datetime for this exact moment in the local timezone
+        """
+        return datetime.datetime.now().astimezone(self.LOCAL_ZONE)
+
     def get_next_sunrise_sunset_times(self):
-        # Specify the local date so that we don't get tomorrow's sunset/sunrise times if it has passed UTC midnight
+        """
+        Sets self.sunset_time and self.sunrise_time for the current sunset and sunrise
+        times for today. This may be in the past if either already happened today.
+        """
         today = datetime.datetime.now()
         today_str = f'{today.year}-{today.month}-{today.day}'
         logging.info(f"Today is {today_str}")
         url = f'{self.sunrise_sunset_api_url_base}&date={today_str}'
-        sunrise_sunset = requests.get(url)
+        sunrise_sunset = requests.get(url, timeout=self.HTTP_REQUEST_TIMEOUT_SEC)
         sunrise_sunset.raise_for_status()
         sunrise_sunset_data = sunrise_sunset.json()
 
@@ -60,36 +87,49 @@ class LightController(object):
         logging.info(f"Sunrise time: {self.sunrise_time}")
 
         sunset_time = sunrise_sunset_data['results']['sunset']
-        self.sunset_time = self.convert_utc_string_to_local_datetime_obj(sunset_time)
+        self.sunset_time = self.convert_utc_string_to_local_datetime_obj(sunset_time) - datetime.timedelta(seconds=self.PRE_SUNSET_BUFFER_SECONDS)
         logging.info(f"Sunset time:  {self.sunset_time}")
 
     def set_schedule(self):
+        """
+        Sets self.schedule as a dictionary of {local datetime.datetime: function_to_run}.
+        The run() function iterates over this schedule in order of which task should be executed
+
+        Always schedules itself at 10 seconds after midnight.
+        Does not schedule either turn on/off lights if sunset/sunrise have already happened, respectively.
+        """
         self.get_next_sunrise_sunset_times()
         self.schedule = {}
 
-        now = datetime.datetime.now().astimezone(self.LOCAL_ZONE)
+        now = self.now()
         tomorrow = now + datetime.timedelta(days=1)
-        time_until_midnight = datetime.datetime.combine(tomorrow, datetime.time.min).astimezone(self.LOCAL_ZONE) - now
-        self.schedule[time_until_midnight.total_seconds() + self.POST_MIDNIGHT_BUFFER_SEC] = self.set_schedule
+        midnight = datetime.datetime.combine(tomorrow, datetime.time.min).astimezone(self.LOCAL_ZONE) + datetime.timedelta(seconds=self.POST_MIDNIGHT_BUFFER_SEC)
+        self.schedule[midnight] = self.set_schedule
 
-        time_until_sunrise = (self.sunrise_time - now).total_seconds()
-        if time_until_sunrise >= 0:
-            self.schedule[time_until_sunrise] = self.turn_off_lights
+        if now < self.sunrise_time:
+            self.schedule[self.sunrise_time] = self.turn_off_lights
         else:
-            logging.info("Sunrise already happened today, not scheduling turn_off_lights until tomorrow.")
+            logging.info(f"Sunrise already happened today, not scheduling turn_off_lights until {midnight}.")
 
-        time_until_sunset = (self.sunset_time - now).total_seconds()
-        if time_until_sunset >= 0:
-            if time_until_sunset >= self.PRE_SUNSET_BUFFER_SECONDS:
-                time_until_sunset = time_until_sunset - self.PRE_SUNSET_BUFFER_SECONDS
-            self.schedule[time_until_sunset] = self.turn_on_lights
+        if now < self.sunset_time:
+            self.schedule[self.sunset_time] = self.turn_on_lights
         else:
-            logging.info("Sunset already happened today, not scheduling turn_on_lights until tomorrow.")
+            logging.info(f"Sunset already happened today, not scheduling turn_on_lights until {midnight}.")
 
-        logging.info(f"Schedule: {self.schedule}")
+        logging.info("Schedule:")
+        for time_scheduled, task_func in sorted(self.schedule.items()):
+            logging.info(f"  * {time_scheduled}: {task_func.__name__}")
 
     def toggle_lights(self, on_or_off):
+        """
+        Discovers all WeMo light devices on the network and either turns
+        them all on or all off, depending on the parameter.
+
+        Raises an exception if the device does not end up in the
+        correct state after self.LIGHT_RESPONSE_TIMEOUT_SEC seconds.
+        """
         self.discover_devices()
+        logging.info(f"Turning {on_or_off.name} {len(self.devices)} lights.")
 
         for d in self.devices:
             if on_or_off == LightStatus.ON:
@@ -101,30 +141,40 @@ class LightController(object):
 
             cmd()
 
-            done = True
+            t0 = time.time()
+            done = False
             while not done:
-                if d.state != on_or_off:
+                if d.get_state() != on_or_off:
+                    if time.time() - t0 > self.LIGHT_RESPONSE_TIMEOUT_SEC:
+                        raise Exception(f"Failed to turn {on_or_off.name} device {d.name} after {self.LIGHT_RESPONSE_TIMEOUT_SEC} seconds.")
+                    sleep(self.LIGHT_RESPONSE_BACKOFF_SEC)
                     cmd()
-                    sleep(1)
-                    done = False
+                    done = True
 
     def turn_on_lights(self):
+        """
+        Convenience function to call toggle_lights(ON)
+        """
         self.toggle_lights(LightStatus.ON)
 
     def turn_off_lights(self):
+        """
+        Convenience function to call toggle_lights(OFF)
+        """
         self.toggle_lights(LightStatus.OFF)
 
     def run(self):
-        # TODO: Make sure lights are in the correct state based on time of day before starting the schedule loop
-
+        """
+        Loops over self.schedule forever, in order, with the closest upcoming task first.
+        Sleeps until it is time to execute the task and then calls the function.
+        """
         while True:
             schedule = dict(self.schedule)  # Make a copy since one of the tasks updates the schedule
-            already_slept = 0
-            for time_until_next_task, task_func in sorted(schedule.items()):
-                to_sleep = time_until_next_task - already_slept
-                logging.info(f"Sleeping {to_sleep:.0f} seconds until running {task_func.__name__}")
-                sleep(to_sleep)
-                already_slept += to_sleep
+            for time_scheduled, task_func in sorted(schedule.items()):
+                now = self.now()
+                time_until_task = (time_scheduled - now).total_seconds()
+                logging.info(f"Sleeping {strftime('%H hours, %M minutes, and %S seconds', gmtime(time_until_task))} until running {task_func.__name__}.")
+                sleep(time_until_task)
                 logging.info(f'Running {task_func.__name__}')
                 task_func()
 
@@ -137,8 +187,15 @@ def main():
     parser.add_argument('--long', required=True, type=float, help="Longitude as a floating point number.")
     args = parser.parse_args()
 
-    lc = LightController(lat=args.lat, lng=args.long)
-    lc.run()
+    # Create the LightController and run forever. If there's an unhandled exception sleep a bit and restart
+    while True:
+        try:
+            lc = LightController(lat=args.lat, lng=args.long)
+            lc.run()
+        except Exception:
+            logging.error(f"Unhandled exception\n{traceback.format_exc()}")
+            logging.error(f"Sleeping {LightController.RELAUNCH_SLEEP_SEC} seconds and running again.")
+            sleep(LightController.RELAUNCH_SLEEP_SEC)
 
 
 if __name__ == '__main__':
