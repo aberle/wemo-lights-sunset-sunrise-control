@@ -21,7 +21,6 @@ class LightController(object):
     UTC_ZONE = tz.tzutc()
     LOCAL_ZONE = tz.tzlocal()
     DATE_FMT_STRING = '%Y-%m-%dT%H:%M:%S+00:00'
-    DAILY_SCHEDULE_TIME = '00:00'
     POST_MIDNIGHT_BUFFER_SEC = 10
     PRE_SUNSET_BUFFER_SECONDS = 30 * 60  # Turn the lights on this many seconds before actual sunset time
 
@@ -32,6 +31,7 @@ class LightController(object):
         return utc.astimezone(self.LOCAL_ZONE)
 
     def discover_devices(self):
+        # TODO: This finds all WeMo devices, it doesn't filter by which devices are lights or not (maybe I don't care, I only have lights)
         logging.info("Discovering WeMo devices on the local network...")
         t0 = time.time()
         self.devices = pywemo.discover_devices()
@@ -106,7 +106,7 @@ class LightController(object):
                 if d.state != on_or_off:
                     cmd()
                     sleep(1)
-                    all_done = False
+                    done = False
 
     def turn_on_lights(self):
         self.toggle_lights(LightStatus.ON)
