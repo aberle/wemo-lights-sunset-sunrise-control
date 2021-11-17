@@ -25,6 +25,8 @@ class LightController(object):
     POST_MIDNIGHT_BUFFER_SEC = 10
     PRE_SUNSET_BUFFER_SECONDS = 30 * 60  # Turn the lights on this many seconds before actual sunset time
     LIGHT_DEVICE_TYPES = ['LightSwitch', 'Switch', 'Dimmer']
+    LONG_PRESS_DEVICE_TYPES = ['Dimmer']
+    LONG_PRESS_TOGGLE_EXCLUDE = ['Porch Lights']
     LIGHT_RESPONSE_TIMEOUT_SEC = 10
     LIGHT_RESPONSE_BACKOFF_SEC = 0.25
     HTTP_REQUEST_TIMEOUT_SEC = 10
@@ -32,14 +34,21 @@ class LightController(object):
 
     def __init__(self, lat, lng):
         super(LightController, self).__init__()
+        self.sub = pywemo.SubscriptionRegistry()
+        logging.info("Starting SubscriptionRegistry HTTP server")
+        self.sub.start()
+        self.registered_long_press_devices = []
         self.sunrise_sunset_api_url_base = f'https://api.sunrise-sunset.org/json?lat={lat}&lng={lng}&formatted=0'
         self.set_schedule()
 
         # Make sure that if we crashed while trying to turn on/off lights we don't come back in a bad state
+        self.discover_devices()
         now = self.now()
         if now > self.sunset_time:
+            logging.info("It is after sunset, turning all lights on.")
             self.turn_on_lights()
         elif now > self.sunrise_time:
+            logging.info("It is after sunrise, turning all lights off.")
             self.turn_off_lights()
 
     def convert_utc_string_to_local_datetime_obj(self, utc_str):
@@ -51,14 +60,46 @@ class LightController(object):
         utc = time_obj.replace(tzinfo=self.UTC_ZONE)
         return utc.astimezone(self.LOCAL_ZONE)
 
+    def toggle_lights_cb(self, _device, _type, _params):
+        """
+        Callback that is run when a long-press is detected. Toggles all lights that are not
+        in the self.LONG_PRESS_TOGGLE_EXCLUDE list regardless of their current state.
+
+        In case we have a problem (e.g. the IP address of the lights changes), try to rediscover them
+        """
+        try:
+            for d in self.devices:
+                if d.name not in self.LONG_PRESS_TOGGLE_EXCLUDE:
+                    d.toggle()
+                    logging.info(f"Toggled light {d.name}, it is now {str(LightStatus(d.get_state()))}")
+        except Exception:
+            logging.error(f"Encountered a problem toggling lights, rediscovering. traceback={traceback.format_exc()}")
+            self.discover_devices()
+
     def discover_devices(self):
         """
-        This finds all WeMo devices that are in the self.LIGHT_DEVICE_TYPES list
+        This finds all WeMo devices whose type is in the self.LIGHT_DEVICE_TYPES list.
+        It will also register any device whose type is in the self.LONG_PRESS_DEVICE_TYPES list
+        to trigger the toggle_lights_cb() function when a long press is detected on that device.
         """
         logging.info("Discovering WeMo devices on the local network...")
         t0 = time.time()
+
+        # Unregister all devices from the SubscriptionRegistry in case they have changed
+        for d in self.registered_long_press_devices:
+            self.sub.unregister(d)
+        self.registered_long_press_devices = []
+
         self.devices = [d for d in pywemo.discover_devices() if d.device_type in self.LIGHT_DEVICE_TYPES]
+        for d in self.devices:
+            if d.device_type in self.LONG_PRESS_DEVICE_TYPES:
+                d.ensure_long_press_virtual_device()
+                self.sub.register(d)
+                self.registered_long_press_devices.append(d)
+                self.sub.on(d, pywemo.subscribe.EVENT_TYPE_LONG_PRESS, self.toggle_lights_cb)
+
         logging.info(f"Found {len(self.devices)} WeMo devices in {time.time() - t0:.2f} seconds.")
+        logging.info(f"Registered {len(self.registered_long_press_devices)} devices for watching long-press events.")
 
     def now(self):
         """
@@ -120,7 +161,7 @@ class LightController(object):
         for time_scheduled, task_func in sorted(self.schedule.items()):
             logging.info(f"  * {time_scheduled}: {task_func.__name__}")
 
-    def toggle_lights(self, on_or_off):
+    def set_light_state(self, on_or_off):
         """
         Discovers all WeMo light devices on the network and either turns
         them all on or all off, depending on the parameter.
@@ -153,15 +194,15 @@ class LightController(object):
 
     def turn_on_lights(self):
         """
-        Convenience function to call toggle_lights(ON)
+        Convenience function to call set_light_state(ON)
         """
-        self.toggle_lights(LightStatus.ON)
+        self.set_light_state(LightStatus.ON)
 
     def turn_off_lights(self):
         """
-        Convenience function to call toggle_lights(OFF)
+        Convenience function to call set_light_state(OFF)
         """
-        self.toggle_lights(LightStatus.OFF)
+        self.set_light_state(LightStatus.OFF)
 
     def run(self):
         """
