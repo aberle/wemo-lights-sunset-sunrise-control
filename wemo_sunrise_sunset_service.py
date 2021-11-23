@@ -62,15 +62,17 @@ class LightController(object):
         utc = time_obj.replace(tzinfo=self.UTC_ZONE)
         return utc.astimezone(self.LOCAL_ZONE)
 
-    def master_light_cb(self, device, type, param):
+    def master_light_cb(self, device, typ, param):
         """
         Callback that is run when a master light reports a BINARY_STATE event. Turns on or off all lights
         that are not in the self.MASTER_DEVICE_CONTROL_EXCLUDE list depending on what the event reports.
         In case we have a problem (e.g. the IP address of the lights changes), try to rediscover them
         """
+        logging.info(f"{'Ignoring the first' if not self.did_ignore_first_sub_event else 'Got a' } {typ}:{param} event from device {device}")
+
         if not self.did_ignore_first_sub_event:
-            # Ignore the first event reporting the state of the light so that it does not
-            # interfere with the initial on/off setting based on the sunrise/sunset time
+            # Ignore the first event reporting the state of the light so that it does
+            # not contradict the first command sent after device discovery
             self.did_ignore_first_sub_event = True
             return
 
@@ -96,6 +98,7 @@ class LightController(object):
         for d in self.registered_master_devices:
             self.sub.unregister(d)
         self.registered_master_devices = []
+        self.did_ignore_first_sub_event = False
 
         self.devices = [d for d in pywemo.discover_devices() if d.device_type in self.LIGHT_DEVICE_TYPES]
         for d in self.devices:
@@ -106,7 +109,7 @@ class LightController(object):
                 self.sub.on(d, pywemo.subscribe.EVENT_TYPE_BINARY_STATE, self.master_light_cb)
 
         logging.info(f"Found {len(self.devices)} WeMo devices in {time.time() - t0:.2f} seconds.")
-        logging.info(f"Registered {len(self.registered_master_devices)} devices for watching long-press events.")
+        logging.info(f"Registered {len(self.registered_master_devices)} master devices for controlling other lights.")
 
     def now(self):
         """
