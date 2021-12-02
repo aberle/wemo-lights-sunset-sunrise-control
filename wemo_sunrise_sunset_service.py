@@ -25,9 +25,9 @@ class LightController(object):
     DATE_FMT_STRING = '%Y-%m-%dT%H:%M:%S+00:00'
     POST_MIDNIGHT_BUFFER_SEC = 10
     PRE_SUNSET_BUFFER_SECONDS = 30 * 60  # Turn the lights on this many seconds before actual sunset time
-    LIGHT_DEVICE_TYPES = ['LightSwitch', 'Switch', 'Dimmer']
+    LIGHT_DEVICE_TYPES = ['LightSwitch', 'Switch', 'Dimmer', 'OutdoorPlug']
     MASTER_DEVICE = 'Dimmer'
-    MASTER_DEVICE_CONTROL_EXCLUDE = ['Porch Lights']
+    MASTER_DEVICE_CONTROL_EXCLUDE = ['Porch Lights', 'Outdoor Outlet']
     LIGHT_RESPONSE_TIMEOUT_SEC = 10
     LIGHT_RESPONSE_BACKOFF_SEC = 0.25
     HTTP_REQUEST_TIMEOUT_SEC = 10
