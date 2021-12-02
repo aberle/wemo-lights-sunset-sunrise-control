@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 
-import pywemo
+import sys
 import time
-import logging
 import json
+import pywemo
+import logging
+import colorlog
 import requests
 import datetime
 import traceback
 import threading
+
 from enum import Enum
 from dateutil import tz
-from time import mktime, sleep, strftime, gmtime
 from argparse import ArgumentParser
+from time import mktime, sleep, strftime, gmtime
 
 
 class LightStatus(Enum):
@@ -23,19 +26,28 @@ class LightController(object):
     UTC_ZONE = tz.tzutc()
     LOCAL_ZONE = tz.tzlocal()
     DATE_FMT_STRING = '%Y-%m-%dT%H:%M:%S+00:00'
-    POST_MIDNIGHT_BUFFER_SEC = 10
-    PRE_SUNSET_BUFFER_SECONDS = 30 * 60  # Turn the lights on this many seconds before actual sunset time
-    LIGHT_DEVICE_TYPES = ['LightSwitch', 'Switch', 'Dimmer', 'OutdoorPlug']
-    MASTER_DEVICE = 'Dimmer'
-    MASTER_DEVICE_CONTROL_EXCLUDE = ['Porch Lights', 'Outdoor Outlet']
-    LIGHT_RESPONSE_TIMEOUT_SEC = 10
-    LIGHT_RESPONSE_BACKOFF_SEC = 0.25
-    HTTP_REQUEST_TIMEOUT_SEC = 10
     RELAUNCH_SLEEP_SEC = 10
+
+    DEFAULT_CONFIG = {
+        'POST_MIDNIGHT_BUFFER_SEC': 10,
+        'PRE_SUNSET_BUFFER_MINUTES': 45,
+        'LIGHT_RESPONSE_TIMEOUT_SEC': 10,
+        'LIGHT_RESPONSE_BACKOFF_SEC': 0.25,
+        'HTTP_REQUEST_TIMEOUT_SEC': 10,
+        'CONTROL_MAP': {
+            'Living Room Dimmer': ['Living Room Lamp', 'Living Room Corner Lamp'],
+            'Porch Lights': ['Outdoor Outlet']
+        }
+    }
 
     def __init__(self, lat, lng):
         super(LightController, self).__init__()
-        self.did_ignore_first_sub_event = False
+
+        # TODO: read config from a file and fill in the blanks with DEFAULT_CONFIG
+        self.config = self.DEFAULT_CONFIG
+        self.control_map = self.config.get('CONTROL_MAP', {})
+
+        self.did_ignore_first_sub_event = {d: False for d in self.control_map}
         self.sub = pywemo.SubscriptionRegistry()
         logging.info("Starting SubscriptionRegistry HTTP server")
         self.sub.start()
@@ -64,32 +76,31 @@ class LightController(object):
 
     def master_light_cb(self, device, typ, param):
         """
-        Callback that is run when a master light reports a BINARY_STATE event. Turns on or off all lights
-        that are not in the self.MASTER_DEVICE_CONTROL_EXCLUDE list depending on what the event reports.
+        Callback that is run when a master light reports a BINARY_STATE event. Turns on or off all
+        dependent lights in self.control_list depending on what the event reports.
         In case we have a problem (e.g. the IP address of the lights changes), try to rediscover them
         """
-        logging.info(f"{'Ignoring the first' if not self.did_ignore_first_sub_event else 'Got a' } {typ}:{param} event from device {device}")
+        logging.info(f"{'Ignoring the first' if not self.did_ignore_first_sub_event[device.name] else 'Got a' } {typ}:{param} event from device {device.name}")
 
-        if not self.did_ignore_first_sub_event:
+        if not self.did_ignore_first_sub_event[device.name]:
             # Ignore the first event reporting the state of the light so that it does
             # not contradict the first command sent after device discovery
-            self.did_ignore_first_sub_event = True
+            self.did_ignore_first_sub_event[device.name] = True
             return
 
         try:
             if LightStatus(int(param)) == LightStatus.OFF:
-                self.turn_off_lights(do_discover=False, exclude=self.MASTER_DEVICE_CONTROL_EXCLUDE)
+                self.turn_off_lights(do_discover=False, only=self.control_map[device.name])
             else:
-                self.turn_on_lights(do_discover=False, exclude=self.MASTER_DEVICE_CONTROL_EXCLUDE)
+                self.turn_on_lights(do_discover=False, only=self.control_map[device.name])
         except Exception:
             logging.error(f"Encountered a problem toggling lights, rediscovering. traceback={traceback.format_exc()}")
             self.discover_devices()
 
     def discover_devices(self):
         """
-        This finds all WeMo devices whose type is in the self.LIGHT_DEVICE_TYPES list.
-        It will also register any device whose name is self.MASTER_DEVICE to trigger
-        the master_light_cb() function when that device is turned on or off.
+        This finds all WeMo devices on the network. It will also register all master
+        devices in self.control_map to toggle their assigned dependent devices accordingly.
         """
         logging.info("Discovering WeMo devices on the local network...")
         t0 = time.time()
@@ -98,11 +109,11 @@ class LightController(object):
         for d in self.registered_master_devices:
             self.sub.unregister(d)
         self.registered_master_devices = []
-        self.did_ignore_first_sub_event = False
 
-        self.devices = [d for d in pywemo.discover_devices() if d.device_type in self.LIGHT_DEVICE_TYPES]
-        for d in self.devices:
-            if d.device_type in self.MASTER_DEVICE:
+        self.devices = {d.name: d for d in pywemo.discover_devices()}
+        for dname, d in self.devices.items():
+            if dname in self.control_map:
+                self.did_ignore_first_sub_event[dname] = False
                 d.ensure_long_press_virtual_device()
                 self.sub.register(d)
                 self.registered_master_devices.append(d)
@@ -126,7 +137,7 @@ class LightController(object):
         today_str = f'{today.year}-{today.month}-{today.day}'
         logging.info(f"Today is {today_str}")
         url = f'{self.sunrise_sunset_api_url_base}&date={today_str}'
-        sunrise_sunset = requests.get(url, timeout=self.HTTP_REQUEST_TIMEOUT_SEC)
+        sunrise_sunset = requests.get(url, timeout=self.config['HTTP_REQUEST_TIMEOUT_SEC'])
         sunrise_sunset.raise_for_status()
         sunrise_sunset_data = sunrise_sunset.json()
 
@@ -137,8 +148,9 @@ class LightController(object):
         self.sunrise_time = self.convert_utc_string_to_local_datetime_obj(sunrise_time)
         logging.info(f"Sunrise time: {self.sunrise_time}")
 
+        # Turn the lights on PRE_SUNSET_BUFFER_MINUTES before actual sunset
         sunset_time = sunrise_sunset_data['results']['sunset']
-        self.sunset_time = self.convert_utc_string_to_local_datetime_obj(sunset_time) - datetime.timedelta(seconds=self.PRE_SUNSET_BUFFER_SECONDS)
+        self.sunset_time = self.convert_utc_string_to_local_datetime_obj(sunset_time) - datetime.timedelta(minutes=self.config['PRE_SUNSET_BUFFER_MINUTES'])
         logging.info(f"Sunset time:  {self.sunset_time}")
 
     def set_schedule(self):
@@ -146,7 +158,7 @@ class LightController(object):
         Sets self.schedule as a dictionary of {local datetime.datetime: function_to_run}.
         The run() function iterates over this schedule in order of which task should be executed
 
-        Always schedules itself at 10 seconds after midnight.
+        Always schedules itself at POST_MIDNIGHT_BUFFER_SEC after midnight.
         Does not schedule either turn on/off lights if sunset/sunrise have already happened, respectively.
         """
         self.get_next_sunrise_sunset_times()
@@ -154,7 +166,7 @@ class LightController(object):
 
         now = self.now()
         tomorrow = now + datetime.timedelta(days=1)
-        midnight = datetime.datetime.combine(tomorrow, datetime.time.min).astimezone(self.LOCAL_ZONE) + datetime.timedelta(seconds=self.POST_MIDNIGHT_BUFFER_SEC)
+        midnight = datetime.datetime.combine(tomorrow, datetime.time.min).astimezone(self.LOCAL_ZONE) + datetime.timedelta(seconds=self.config['POST_MIDNIGHT_BUFFER_SEC'])
         self.schedule[midnight] = self.set_schedule
 
         if now < self.sunrise_time:
@@ -185,29 +197,35 @@ class LightController(object):
         done = False
         while not done:
             if device.get_state() != on_or_off:
-                if time.time() - t0 > self.LIGHT_RESPONSE_TIMEOUT_SEC:
-                    raise Exception(f"Failed to turn {on_or_off.name} device {device.name} after {self.LIGHT_RESPONSE_TIMEOUT_SEC} seconds.")
-                sleep(self.LIGHT_RESPONSE_BACKOFF_SEC)
+                if time.time() - t0 > self.config['LIGHT_RESPONSE_TIMEOUT_SEC']:
+                    raise Exception(f"Failed to turn {on_or_off.name} device {device.name} after {self.config['LIGHT_RESPONSE_TIMEOUT_SEC']} seconds.")
+                sleep(self.config['LIGHT_RESPONSE_BACKOFF_SEC'])
                 cmd()
                 done = True
 
-    def set_light_state(self, on_or_off, do_discover=True, exclude=[]):
+    def set_light_state(self, on_or_off, do_discover=True, only=[]):
         """
         Discovers all WeMo light devices on the network and either turns
         them all on or all off, depending on the parameter.
 
         Raises an exception if the device does not end up in the
-        correct state after self.LIGHT_RESPONSE_TIMEOUT_SEC seconds.
+        correct state after LIGHT_RESPONSE_TIMEOUT_SEC seconds.
         """
         if do_discover:
             self.discover_devices()
 
-        devices = [d for d in self.devices if d.name not in exclude]
-        logging.info(f"Turning {on_or_off.name} {len(devices)} lights.")
+        devices = {}
+        if only:
+            for dname in only:
+                devices[dname] = self.devices[dname]
+        else:
+            devices = self.devices
+
+        logging.info(f"Turning {on_or_off.name} {len(devices)} lights: {[d.name for d in devices.values()]}")
 
         threads = []
 
-        for d in devices:
+        for d in devices.values():
             t = threading.Thread(target=self.run_light_command, args=(d, on_or_off))
             t.start()
             threads.append(t)
@@ -215,17 +233,17 @@ class LightController(object):
         for t in threads:
             t.join()
 
-    def turn_on_lights(self, do_discover=True, exclude=[]):
+    def turn_on_lights(self, do_discover=True, only=[]):
         """
         Convenience function to call set_light_state(ON)
         """
-        self.set_light_state(LightStatus.ON, do_discover, exclude)
+        self.set_light_state(LightStatus.ON, do_discover, only)
 
-    def turn_off_lights(self, do_discover=True, exclude=[]):
+    def turn_off_lights(self, do_discover=True, only=[]):
         """
         Convenience function to call set_light_state(OFF)
         """
-        self.set_light_state(LightStatus.OFF, do_discover, exclude)
+        self.set_light_state(LightStatus.OFF, do_discover, only)
 
     def run(self):
         """
@@ -244,7 +262,14 @@ class LightController(object):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    # Configure logging and set pywemo logging to WARN level only since it's a little noisy
+    formatter = colorlog.ColoredFormatter('%(thin_white)s%(asctime)s%(reset)s [%(log_color)s%(levelname)s%(reset)s] %(message)s',)
+    root = logging.getLogger()
+    log_handler = logging.StreamHandler(sys.stdout)
+    root.setLevel(logging.INFO)
+    log_handler.setFormatter(formatter)
+    root.addHandler(log_handler)
+    logging.getLogger('pywemo').setLevel(logging.WARNING)
 
     parser = ArgumentParser()
     parser.add_argument('--lat', required=True, type=float, help="Latitude as a floating point number.")
