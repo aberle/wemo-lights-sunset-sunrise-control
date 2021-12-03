@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import sys
 import time
 import json
@@ -29,23 +30,23 @@ class LightController(object):
     RELAUNCH_SLEEP_SEC = 10
 
     DEFAULT_CONFIG = {
-        'POST_MIDNIGHT_BUFFER_SEC': 10,
-        'PRE_SUNSET_BUFFER_MINUTES': 45,
+        'POST_MIDNIGHT_BUFFER_SEC': 15,
+        'PRE_SUNSET_BUFFER_MINUTES': 30,
         'LIGHT_RESPONSE_TIMEOUT_SEC': 10,
         'LIGHT_RESPONSE_BACKOFF_SEC': 0.25,
-        'HTTP_REQUEST_TIMEOUT_SEC': 10,
-        'CONTROL_MAP': {
-            'Living Room Dimmer': ['Living Room Lamp', 'Living Room Corner Lamp'],
-            'Porch Lights': ['Outdoor Outlet']
-        }
+        'HTTP_REQUEST_TIMEOUT_SEC': 10
     }
 
     def __init__(self, lat, lng):
         super(LightController, self).__init__()
 
-        # TODO: read config from a file and fill in the blanks with DEFAULT_CONFIG
+        # Read config from a file and fill in the blanks with DEFAULT_CONFIG
         self.config = self.DEFAULT_CONFIG
+        if os.path.exists('config.json'):
+            with open('config.json') as f:
+                self.config.update(json.load(f))
         self.control_map = self.config.get('CONTROL_MAP', {})
+        logging.info(json.dumps(self.config, indent=4))
 
         self.did_ignore_first_sub_event = {d: False for d in self.control_map}
         self.sub = pywemo.SubscriptionRegistry()

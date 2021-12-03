@@ -1,0 +1,8 @@
+{
+    "POST_MIDNIGHT_BUFFER_SEC": 10,
+    "PRE_SUNSET_BUFFER_MINUTES": 45,
+    "CONTROL_MAP": {
+        "Living Room Dimmer": ["Living Room Lamp", "Living Room Corner Lamp"],
+        "Porch Lights": ["Outdoor Outlet"]
+    }
+}
