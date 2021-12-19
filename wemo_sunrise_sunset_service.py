@@ -34,7 +34,8 @@ class LightController(object):
         'PRE_SUNSET_BUFFER_MINUTES': 30,
         'LIGHT_RESPONSE_TIMEOUT_SEC': 10,
         'LIGHT_RESPONSE_BACKOFF_SEC': 0.25,
-        'HTTP_REQUEST_TIMEOUT_SEC': 10
+        'HTTP_REQUEST_TIMEOUT_SEC': 10,
+        'DISCOVER_DEVICES_ATTEMPTS': 5
     }
 
     def __init__(self, lat, lng):
@@ -111,7 +112,18 @@ class LightController(object):
             self.sub.unregister(d)
         self.registered_master_devices = []
 
+        attempts = 1
         self.devices = {d.name: d for d in pywemo.discover_devices()}
+        num_devices_expected = len(self.control_map.keys()) + sum([len(i) for i in self.control_map.values()])
+
+        while len(self.devices) != num_devices_expected and attempts < self.config['DISCOVER_DEVICES_ATTEMPTS']:
+            logging.error(f"Found {len(self.devices)} devices, but expected to find {num_devices_expected}. Discovered devices: {self.devices.keys()}")
+            self.devices = {d.name: d for d in pywemo.discover_devices()}
+            attempts += 1
+
+        if attempts == self.config['DISCOVER_DEVICES_ATTEMPTS']:
+            logging.error(f"Gave up discovring devices after {self.config['DISCOVER_DEVICES_ATTEMPTS']} attempts.")
+
         for dname, d in self.devices.items():
             if dname in self.control_map:
                 self.did_ignore_first_sub_event[dname] = False
