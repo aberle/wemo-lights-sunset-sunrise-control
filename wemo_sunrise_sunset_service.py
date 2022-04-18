@@ -54,7 +54,7 @@ class LightController(object):
         logging.info("Starting SubscriptionRegistry HTTP server")
         self.sub.start()
         self.registered_master_devices = []
-        self.sunrise_sunset_api_url_base = f'https://api.sunrise-sunset.org/json?lat={lat}&lng={lng}&formatted=0'
+        self.sunrise_sunset_api_url_base = f'http://api.sunrise-sunset.org/json?lat={lat}&lng={lng}&formatted=0'
         self.set_schedule()
 
         # Make sure that if we crashed while trying to turn on/off lights we don't come back in a bad state
@@ -216,7 +216,7 @@ class LightController(object):
                 cmd()
                 done = True
 
-    def set_light_state(self, on_or_off, do_discover=True, only=[]):
+    def set_light_state(self, on_or_off, do_discover=True, only=None):
         """
         Discovers all WeMo light devices on the network and either turns
         them all on or all off, depending on the parameter.
@@ -228,7 +228,7 @@ class LightController(object):
             self.discover_devices()
 
         devices = {}
-        if only:
+        if only is not None:
             for dname in only:
                 devices[dname] = self.devices[dname]
         else:
@@ -246,13 +246,13 @@ class LightController(object):
         for t in threads:
             t.join()
 
-    def turn_on_lights(self, do_discover=True, only=[]):
+    def turn_on_lights(self, do_discover=True, only=None):
         """
         Convenience function to call set_light_state(ON)
         """
         self.set_light_state(LightStatus.ON, do_discover, only)
 
-    def turn_off_lights(self, do_discover=True, only=[]):
+    def turn_off_lights(self, do_discover=True, only=None):
         """
         Convenience function to call set_light_state(OFF)
         """
